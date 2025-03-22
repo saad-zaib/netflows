@@ -1,0 +1,28 @@
+name: Run Python unit tests
+
+on:
+  push:
+    branches: [ master, release ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-netflow:
+    runs-on: ubuntu-20.04
+    strategy:
+      matrix:
+        python:
+          - "3.5.3"  # Debian Stretch
+          - "3.7.3"  # Debian Buster
+          - "3.9.2"  # Debian Bullseye
+          - "3.11"   # Debian Bookworm uses 3.11.1, but it's in a newer pyenv release
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python with pyenv
+        uses: gabrielfalcao/pyenv-action@v11
+        with:
+          default: "${{ matrix.python }}"
+
+      - name: Run Python unittests
+        run: python3 -m unittest
