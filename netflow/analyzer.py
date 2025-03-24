@@ -215,23 +215,23 @@ class Connection:
         """Convert the connection object to a dictionary for JSON output"""
         return {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "service": self.service,
-            "protocol": IP_PROTOCOLS.get(self.protocol, "UNKNOWN"),
+            "srvc_": self.service,
+            "proto_": IP_PROTOCOLS.get(self.protocol, "UNKNOWN"),
             "size": self.size,
-            "human_size": self.human_size,
+            "hu_1": self.human_size,
             "duration_ms": self.duration,
             "duration_sec": self.raw_duration,
-            "human_duration": self.human_duration,
+            "hu_2": self.human_duration,
             "total_packets": self.total_packets,
-            "source": {
-                "ip": self.src.compressed,
-                "hostname": self.hostnames.src,
-                "port": self.src_port
+            "src_": {
+                "src_ip_addr": self.src.compressed,
+                "src_host_name": self.hostnames.src,
+                "src_port": self.src_port
             },
-            "destination": {
-                "ip": self.dest.compressed,
-                "hostname": self.hostnames.dest,
-                "port": self.dest_port
+            "dst_": {
+                "dst_ip_addr": self.dest.compressed,
+                "dst_host_name": self.hostnames.dest,
+                "dst_port": self.dest_port
             }
         }
 
