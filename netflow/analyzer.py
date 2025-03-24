@@ -214,24 +214,24 @@ class Connection:
     def to_dict(self):
         """Convert the connection object to a dictionary for JSON output"""
         return {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "srvc_": self.service,
-            "proto_": IP_PROTOCOLS.get(self.protocol, "UNKNOWN"),
-            "size": self.size,
-            "hu_1": self.human_size,
-            "duration_ms": self.duration,
-            "duration_sec": self.raw_duration,
-            "hu_2": self.human_duration,
-            "total_packets": self.total_packets,
-            "src_": {
-                "src_ip_addr": self.src.compressed,
-                "src_host_name": self.hostnames.src,
-                "src_port": self.src_port
+            "_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "_srvc_": self.service,
+            "_proto_": IP_PROTOCOLS.get(self.protocol, "UNKNOWN"),
+            "_size": self.size,
+            "_hu_1": self.human_size,
+            "_duration_ms": self.duration,
+            "_duration_sec": self.raw_duration,
+            "_hu_2": self.human_duration,
+            "_total_packets": self.total_packets,
+            "_src_": {
+                "_src_ip_addr": self.src.compressed,
+                "_src_host_name": self.hostnames.src,
+                "_src_port": self.src_port
             },
-            "dst_": {
-                "dst_ip_addr": self.dest.compressed,
-                "dst_host_name": self.hostnames.dest,
-                "dst_port": self.dest_port
+            "_dst_": {
+                "_dst_ip_addr": self.dest.compressed,
+                "_dst_host_name": self.hostnames.dest,
+                "_dst_port": self.dest_port
             }
         }
 
