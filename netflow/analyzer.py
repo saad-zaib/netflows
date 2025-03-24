@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
-"""
-Real-time JSON NetFlow Analyzer
 
-Processes NetFlow data from a JSON file in real-time and outputs analysis as JSON.
-Based on the original analyzer.py script.
-Enhanced with dnspython for better DNS resolution using Google DNS servers.
+"""
+Modified analyzer script for NetFlow Python package.
+Handles JSON entries in the netflow.json file with multiple top-level keys.
+Custom DNS resolution using specified DNS servers.
 """
 
 import argparse
 import contextlib
-import dns.resolver
-import dns.reversename
 import functools
-import ipaddress
 import json
 import logging
 import os.path
 import socket
 import sys
 import time
+import ipaddress
 from collections import namedtuple
 from datetime import datetime
+
+# Add the dns.resolver import for custom DNS resolution
+try:
+    import dns.resolver
+    import dns.reversename
+    HAS_DNSPYTHON = True
+except ImportError:
+    HAS_DNSPYTHON = False
+    logging.warning("dnspython module not found. Custom DNS servers will not be used. Install with: pip install dnspython")
 
 IP_PROTOCOLS = {
     1: "ICMP",
@@ -31,47 +37,60 @@ IP_PROTOCOLS = {
 
 Pair = namedtuple('Pair', ['src', 'dest'])
 
+# Set up logging
 logger = logging.getLogger(__name__)
 ch = logging.StreamHandler()
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 ch.setFormatter(formatter)
 logger.addHandler(ch)
 
-# Configure DNS resolver to use Google DNS
-dns_resolver = dns.resolver.Resolver()
-dns_resolver.nameservers = ['8.8.8.8', '8.8.4.4']  # Google DNS servers
-dns_resolver.timeout = 1.0  # 1 second timeout for DNS queries
-dns_resolver.lifetime = 2.0  # 2 second overall timeout for DNS resolution
 
-@functools.lru_cache(maxsize=1000)  # Limit cache size to prevent memory issues
+def printv(message, *args_, **kwargs):
+    if args.verbose:
+        print(message.format(*args_, **kwargs))
+
+
+@functools.lru_cache(maxsize=None)
 def resolve_hostname(ip: str) -> str:
-    """
-    Resolve an IP address to a hostname using dnspython.
-    Falls back to the original IP if resolution fails.
-
-    Args:
-        ip: IP address to resolve
-
-    Returns:
-        Hostname or original IP if resolution fails or is disabled
-    """
+    """Resolve IP address to hostname using custom DNS servers if specified"""
     if args.no_dns:
-        # If no DNS resolution is requested, simply return the IP string
-        return ip
+        # If no DNS resolution is requested, return empty string
+        return ""
 
-    try:
-        # Convert IP to reverse pointer
-        reverse_name = dns.reversename.from_address(ip)
-        # Perform reverse DNS lookup
-        dns_answer = dns_resolver.resolve(reverse_name, 'PTR')
-        # Return the first PTR record (without trailing dot)
-        return str(dns_answer[0]).rstrip('.')
-    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.Timeout, dns.exception.DNSException) as e:
-        logger.debug(f"DNS resolution failed for {ip}: {e}")
-        return ip
-    except Exception as e:
-        logger.warning(f"Unexpected error resolving {ip}: {e}")
-        return ip
+    # If custom DNS servers are specified and dnspython is available
+    if args.dns_servers and HAS_DNSPYTHON:
+        try:
+            # Create a custom resolver with the specified DNS servers
+            custom_resolver = dns.resolver.Resolver()
+            custom_resolver.nameservers = args.dns_servers
+
+            # Convert IP to reverse pointer format for PTR lookup
+            reverse_name = dns.reversename.from_address(ip)
+
+            # Set a timeout for DNS resolution
+            custom_resolver.timeout = 1.0
+            custom_resolver.lifetime = 1.0
+
+            # Perform the lookup
+            answers = custom_resolver.resolve(reverse_name, 'PTR')
+            if answers:
+                # Return the first response, removing the trailing dot
+                return str(answers[0]).rstrip('.')
+            return args.dns_fallback
+        except Exception as e:
+            if args.verbose:
+                logger.debug(f"DNS resolution failed for {ip}: {str(e)}")
+            return args.dns_fallback
+    else:
+        # Fall back to standard system resolution if custom DNS is not available
+        try:
+            hostname = socket.getfqdn(ip)
+            # If getfqdn returns the same IP, it means resolution failed
+            if hostname == ip:
+                return args.dns_fallback
+            return hostname
+        except Exception:
+            return args.dns_fallback
 
 
 def fallback(d, keys):
@@ -106,12 +125,7 @@ def human_duration(seconds):
 
 
 class Connection:
-    """Connection model for two flows.
-    The direction of the data flow can be seen by looking at the size.
-
-    'src' describes the peer which sends more data towards the other. This
-    does NOT have to mean that 'src' was the initiator of the connection.
-    """
+    """Connection model for two flows."""
 
     def __init__(self, flow1, flow2):
         if not flow1 or not flow2:
@@ -135,12 +149,17 @@ class Connection:
         self.src_port = fallback(src, ['L4_SRC_PORT', 'SRC_PORT'])
         self.dest_port = fallback(dest, ['L4_DST_PORT', 'DST_PORT'])
         self.size = fallback(src, ['IN_BYTES', 'IN_OCTETS'])
+        self.protocol = src.get('PROTOCOL', 0)
 
         # Duration is given in milliseconds
         self.duration = src['LAST_SWITCHED'] - src['FIRST_SWITCHED']
         if self.duration < 0:
             # 32 bit int has its limits. Handling overflow here
             self.duration = (2 ** 32 - src['FIRST_SWITCHED']) + src['LAST_SWITCHED']
+
+    def __repr__(self):
+        return "<Connection from {} to {}, size {}>".format(
+            self.src, self.dest, self.human_size)
 
     @staticmethod
     def get_ips(flow):
@@ -168,6 +187,10 @@ class Connection:
         return human_duration(duration)
 
     @property
+    def raw_duration(self):
+        return self.duration // 1000  # uptime in milliseconds, floor it
+
+    @property
     def hostnames(self):
         # Resolve the IPs of this flows to their hostname
         src_hostname = resolve_hostname(self.src.compressed)
@@ -177,7 +200,7 @@ class Connection:
     @property
     def service(self):
         # Resolve ports to their services, if known
-        default = "({} {})".format(self.src_port, self.dest_port)
+        default = "unknown"
         with contextlib.suppress(OSError):
             return socket.getservbyport(self.src_port)
         with contextlib.suppress(OSError):
@@ -188,248 +211,233 @@ class Connection:
     def total_packets(self):
         return self.src_flow["IN_PKTS"] + self.dest_flow["IN_PKTS"]
 
-    def to_json(self):
-        """Return a JSON-serializable representation of the Connection"""
+    def to_dict(self):
+        """Convert the connection object to a dictionary for JSON output"""
         return {
-            "src": {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "service": self.service,
+            "protocol": IP_PROTOCOLS.get(self.protocol, "UNKNOWN"),
+            "size": self.size,
+            "human_size": self.human_size,
+            "duration_ms": self.duration,
+            "duration_sec": self.raw_duration,
+            "human_duration": self.human_duration,
+            "total_packets": self.total_packets,
+            "source": {
                 "ip": self.src.compressed,
                 "hostname": self.hostnames.src,
-                "port": self.src_port,
+                "port": self.src_port
             },
-            "dest": {
+            "destination": {
                 "ip": self.dest.compressed,
                 "hostname": self.hostnames.dest,
-                "port": self.dest_port,
-            },
-            "service": self.service.upper(),
-            "size": {
-                "bytes": self.size,
-                "human": self.human_size
-            },
-            "duration": {
-                "ms": self.duration,
-                "human": self.human_duration
-            },
-            "packets": self.total_packets,
-            "protocol": IP_PROTOCOLS.get(self.src_flow.get("PROTOCOL", 0), "UNKNOWN"),
+                "port": self.dest_port
+            }
         }
 
 
-class NetFlowAnalyzer:
-    """Process NetFlow data from a JSON file in real-time."""
+def process_file(file_path, processed_lines, match_host=None, packets_threshold=10):
+    """Process the JSON file with single-line JSON entries and return new connections"""
+    new_connections = []
 
-    def __init__(self, input_file, match_host=None, packets_threshold=10, no_dns=False, verbose=False):
-        self.input_file = input_file
-        self.match_host = match_host
-        self.packets_threshold = packets_threshold
-        self.no_dns = no_dns
-        self.verbose = verbose
-        self.pending = {}
-        self.skipped = 0
-        self.processed = 0
-        self.file_position = 0
+    try:
+        with open(file_path, 'r') as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        logger.error(f"File {file_path} not found")
+        return []
 
-        # Track the last position in the file
-        self.last_position = 0
+    # The following dict holds flows which are looking for a peer
+    pending = {}
 
-        # For connection tracking
-        self.seen_connections = set()
+    # Process each line in the file
+    for line_num, line in enumerate(lines):
+        # Skip already processed lines
+        if line_num in processed_lines:
+            continue
 
-    def printv(self, message, *args_, **kwargs):
-        if self.verbose:
-            print(message.format(*args_, **kwargs))
+        # Mark as processed
+        processed_lines.add(line_num)
 
-    def process_data(self, callback=None):
-        """Process all available data from the file and call the callback for each connection.
-
-        Args:
-            callback: Function to call for each connection with signature callback(timestamp, connection)
-        """
         try:
-            with open(self.input_file, 'r') as f:
-                # Seek to the last position we read
-                f.seek(self.last_position)
+            line = line.strip()
+            if not line:  # Skip empty lines
+                continue
 
-                # Read any new data
-                for line in f:
-                    try:
-                        entry = json.loads(line)
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"Failed to parse JSON: {e}")
+            entry = json.loads(line)
+
+            # Check if the entry has the expected structure
+            if "header" not in entry or "flows" not in entry:
+                logger.warning(f"Line {line_num} doesn't have required 'header' and 'flows' fields")
+                continue
+
+            # Get header and flows directly from the entry
+            data = entry
+
+            if data["header"]["version"] == 10:
+                logger.warning("Skipped IPFIX entry, because analysis of IPFIX is not yet implemented")
+                continue
+
+            flows = data.get("flows", [])
+
+            for flow in sorted(flows, key=lambda x: x["FIRST_SWITCHED"]):
+                first_switched = flow["FIRST_SWITCHED"]
+
+                # Find the peer for this connection
+                if "IPV4_SRC_ADDR" in flow or flow.get("IP_PROTOCOL_VERSION") == 4:
+                    local_peer = flow["IPV4_SRC_ADDR"]
+                    remote_peer = flow["IPV4_DST_ADDR"]
+                else:
+                    local_peer = flow["IPV6_SRC_ADDR"]
+                    remote_peer = flow["IPV6_DST_ADDR"]
+
+                # Match on host filter passed in as argumenthostn
+                if match_host and not any([local_peer == match_host, remote_peer == match_host]):
+                    # If a match_host is given but neither local_peer nor remote_peer match
+                    continue
+
+                if first_switched not in pending:
+                    pending[first_switched] = {}
+
+                # Match peers
+                if remote_peer in pending[first_switched]:
+                    # The destination peer put itself into the pending dict, getting and removing entry
+                    peer_flow = pending[first_switched].pop(remote_peer)
+                    if len(pending[first_switched]) == 0:
+                        del pending[first_switched]
+
+                    # Create connection and check packet threshold
+                    con = Connection(flow, peer_flow)
+                    if con.total_packets < packets_threshold:
                         continue
 
-                    if 'timestamp' not in entry:
-                        logger.warning(f"The line does not have a timestamp key: {entry.keys()}")
-                        continue
+                    # Add to new connections
+                    new_connections.append(con)
+                else:
+                    # Flow did not find a matching, pending peer - inserting itself
+                    pending[first_switched][local_peer] = flow
 
-                    ts = entry['timestamp']  # use the timestamp directly
-
-                    if "header" not in entry:
-                        logger.error(f"No header dict in entry")
-                        continue
-
-                    if entry["header"]["version"] == 10:
-                        logger.warning("Skipped IPFIX entry, because analysis of IPFIX is not yet implemented")
-                        continue
-
-                    timestamp = datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M.%S")
-                    client = entry["client"]
-                    flows = entry["flows"]
-
-                    for flow in sorted(flows, key=lambda x: x["FIRST_SWITCHED"]):
-                        first_switched = flow["FIRST_SWITCHED"]
-
-                        # Find the peer information
-                        if "IPV4_SRC_ADDR" in flow or flow.get("IP_PROTOCOL_VERSION") == 4:
-                            local_peer = flow["IPV4_SRC_ADDR"]
-                            remote_peer = flow["IPV4_DST_ADDR"]
-                        else:
-                            local_peer = flow["IPV6_SRC_ADDR"]
-                            remote_peer = flow["IPV6_DST_ADDR"]
-
-                        # Match on host filter passed in as argument
-                        if self.match_host and not any([local_peer == self.match_host, remote_peer == self.match_host]):
-                            # If a match_host is given but neither local_peer nor remote_peer match
-                            continue
-
-                        if first_switched not in self.pending:
-                            self.pending[first_switched] = {}
-
-                        # Match peers
-                        if remote_peer in self.pending[first_switched]:
-                            # The destination peer put itself into the pending dict, getting and removing entry
-                            peer_flow = self.pending[first_switched].pop(remote_peer)
-                            if len(self.pending[first_switched]) == 0:
-                                del self.pending[first_switched]
-                        else:
-                            # Flow did not find a matching, pending peer - inserting itself
-                            self.pending[first_switched][local_peer] = flow
-                            continue
-
-                        con = Connection(flow, peer_flow)
-                        if con.total_packets < self.packets_threshold:
-                            self.skipped += 1
-                            continue
-
-                        # Generate a unique identifier for this connection
-                        con_id = f"{con.src.compressed}:{con.src_port}-{con.dest.compressed}:{con.dest_port}"
-
-                        # Skip if we've already seen this connection
-                        if con_id in self.seen_connections:
-                            continue
-
-                        # Mark connection as seen
-                        self.seen_connections.add(con_id)
-
-                        # Process the connection
-                        self.processed += 1
-
-                        # Call the callback if provided
-                        if callback:
-                            callback(timestamp, con)
-
-                # Remember where we got to for next time
-                self.last_position = f.tell()
-
+        except json.JSONDecodeError:
+            logger.error(f"Error decoding JSON at line {line_num}: {line[:50]}...")
         except Exception as e:
-            logger.error(f"Error processing file: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"Error processing line {line_num}: {str(e)}")
 
-    def analyze_continuously(self, interval=1.0, output_file=None):
-        """
-        Continuously analyze the NetFlow data as it comes in.
+    return new_connections
 
-        Args:
-            interval: How often to check for new data (in seconds)
-            output_file: Where to write the JSON output (None for stdout)
-        """
-        def process_connection(timestamp, connection):
-            # Create JSON output
-            output = {
-                "timestamp": timestamp,
-                "connection": connection.to_json()
-            }
 
-            # Output as JSON
-            json_out = json.dumps(output)
-            if output_file:
-                with open(output_file, 'a') as f:
-                    f.write(json_out + '\n')
-            else:
-                print(json_out)
+def monitor_file(file_path, interval=1.0, match_host=None, packets_threshold=10, output_file=None):
+    """Monitor a file for changes and process new lines"""
+    processed_lines = set()
+    last_size = 0
 
-        print("Starting real-time analysis. Press Ctrl+C to stop.")
+    print(json.dumps({"status": "starting", "message": "Starting to monitor file", "file": file_path}))
+
+    while True:
         try:
-            while True:
-                self.process_data(callback=process_connection)
+            # Check if file exists and has changed size
+            try:
+                current_size = os.path.getsize(file_path)
+            except FileNotFoundError:
+                # Wait for the file to be created
                 time.sleep(interval)
+                continue
+
+            if current_size > last_size:
+                # Process the file
+                new_connections = process_file(
+                    file_path,
+                    processed_lines,
+                    match_host=match_host,
+                    packets_threshold=packets_threshold
+                )
+
+                # Output connections as JSON
+                if new_connections:
+                    for conn in new_connections:
+                        # Output each connection as a single-line JSON
+                        json_output = json.dumps(conn.to_dict(), separators=(',', ':'))
+
+                        if output_file:
+                            with open(output_file, 'a') as f:
+                                f.write(json_output + "\n")
+                        else:
+                            print(json_output)
+
+                last_size = current_size
+
+            # Wait before checking again
+            time.sleep(interval)
+
         except KeyboardInterrupt:
-            print("\nAnalysis stopped.")
-        finally:
-            if self.verbose:
-                print(f"Processed {self.processed} connections, skipped {self.skipped} connections below threshold.")
-            # Print DNS cache statistics
-            cache_info = resolve_hostname.cache_info()
-            print(f"DNS cache statistics: {cache_info.hits} hits, {cache_info.misses} misses, {cache_info.currsize}/{cache_info.maxsize} size")
+            print(json.dumps({"status": "stopped", "message": "Monitoring stopped by user"}))
+            break
+        except Exception as e:
+            logger.error(f"Unexpected error: {str(e)}")
+            time.sleep(interval)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Real-time analysis of NetFlow data from JSON")
-    parser.add_argument("-f", "--file", dest="file", type=str, default="netflows.json",
-                        help="JSON file to analyze (defaults to netflows.json)")
+    parser = argparse.ArgumentParser(description="Monitor and analyze NetFlow JSON data in real-time")
+    parser.add_argument("-f", "--file", dest="file", type=str, default="netflow.json",
+                      help="The JSON file to monitor (defaults to netflow.json)")
     parser.add_argument("-o", "--output", dest="output", type=str, default=None,
-                        help="Output file for JSON results (defaults to stdout)")
+                      help="Output file for JSON results (defaults to stdout)")
     parser.add_argument("-i", "--interval", dest="interval", type=float, default=1.0,
-                        help="Polling interval in seconds (default: 1.0)")
+                      help="Interval in seconds to check for file changes (default: 1.0)")
     parser.add_argument("-p", "--packets", dest="packets_threshold", type=int, default=1,
-                        help="Number of packets representing the lower bound in connections to be processed")
+                      help="Number of packets representing the lower bound in connections to be processed")
     parser.add_argument("-v", "--verbose", dest="verbose", action="store_true",
-                        help="Enable verbose output")
+                      help="Enable verbose output.")
     parser.add_argument("--match-host", dest="match_host", type=str, default=None,
-                        help="Filter output by matching on the given host (matches source or destination)")
+                      help="Filter output by matching on the given host (matches source or destination)")
     parser.add_argument("-n", "--no-dns", dest="no_dns", action="store_true",
-                        help="Disable DNS resolving of IP addresses")
-    parser.add_argument("--dns-timeout", dest="dns_timeout", type=float, default=1.0,
-                        help="Timeout for DNS queries in seconds (default: 1.0)")
-    parser.add_argument("--dns-servers", dest="dns_servers", type=str, default="8.8.8.8,8.8.4.4",
-                        help="Comma-separated list of DNS servers to use (default: Google DNS)")
+                      help="Disable DNS resolving of IP addresses")
+
+    # Add new arguments for custom DNS resolution
+    parser.add_argument("--dns-servers", dest="dns_servers", type=str, nargs="+", default=None,
+                      help="Custom DNS servers to use (e.g. 8.8.8.8 1.1.1.1)")
+    parser.add_argument("--dns-fallback", dest="dns_fallback", type=str, default="others.com",
+                      help="Value to use when DNS resolution fails (default: others.com, use empty string for blank)")
+
     args = parser.parse_args()
 
-    # Configure logging level
+    # Set logging
     logger.setLevel(logging.DEBUG if args.verbose else logging.INFO)
 
-    # Update DNS resolver with command line arguments
-    if hasattr(args, 'dns_timeout'):
-        dns_resolver.timeout = args.dns_timeout
-        dns_resolver.lifetime = args.dns_timeout * 2
-
-    if hasattr(args, 'dns_servers'):
-        try:
-            dns_servers = args.dns_servers.split(',')
-            if dns_servers:
-                dns_resolver.nameservers = dns_servers
-                logger.info(f"Using DNS servers: {', '.join(dns_servers)}")
-        except Exception as e:
-            logger.warning(f"Failed to set DNS servers, using defaults: {e}")
-
-    # Sanity check for IP address
+    # Sanity check for IP address matching
     if args.match_host:
         try:
             match_host = ipaddress.ip_address(args.match_host)
         except ValueError:
-            exit("IP address '{}' is neither IPv4 nor IPv6".format(args.match_host))
+            print(json.dumps({"status": "error", "message": f"IP address '{args.match_host}' is neither IPv4 nor IPv6"}))
+            exit(1)
 
-    # Check if input file exists or can be created
-    if not os.path.exists(args.file) and not os.access(os.path.dirname(args.file) or '.', os.W_OK):
-        exit(f"File {args.file} does not exist and cannot be created!")
+    # Validate DNS servers if provided
+    if args.dns_servers:
+        # Check if dnspython is available
+        if not HAS_DNSPYTHON:
+            logger.warning("dnspython module not installed. Custom DNS servers will not be used.")
+            logger.warning("Install dnspython with: pip install dnspython")
 
-    # Create the analyzer and run continuously
-    analyzer = NetFlowAnalyzer(
-        input_file=args.file,
+        # Validate each IP address
+        valid_servers = []
+        for server in args.dns_servers:
+            try:
+                ipaddress.ip_address(server)
+                valid_servers.append(server)
+            except ValueError:
+                logger.warning(f"Invalid DNS server IP: {server} - skipping")
+
+        args.dns_servers = valid_servers
+        if not valid_servers:
+            logger.warning("No valid DNS servers provided, falling back to system DNS")
+            args.dns_servers = None
+
+    # Start monitoring
+    monitor_file(
+        args.file,
+        interval=args.interval,
         match_host=args.match_host,
         packets_threshold=args.packets_threshold,
-        no_dns=args.no_dns,
-        verbose=args.verbose
+        output_file=args.output
     )
-    analyzer.analyze_continuously(interval=args.interval, output_file=args.output)
