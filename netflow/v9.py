@@ -16,7 +16,7 @@ import ipaddress
 import struct
 import sys
 
-from .ipfix import IPFIXFieldTypes, IPFIXDataTypes
+from ipfix import IPFIXFieldTypes, IPFIXDataTypes
 
 __all__ = ["V9DataFlowSet", "V9DataRecord", "V9ExportPacket", "V9Header", "V9TemplateField",
            "V9TemplateFlowSet", "V9TemplateNotRecognized", "V9TemplateRecord",
