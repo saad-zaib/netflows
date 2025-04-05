@@ -38,9 +38,9 @@ try:
 except ImportError:
     PROMETHEUS_AVAILABLE = False
 
-from netflow.ipfix import IPFIXTemplateNotRecognized
-from netflow.utils import UnknownExportVersion, parse_packet
-from netflow.v9 import V9TemplateNotRecognized
+from ipfix import IPFIXTemplateNotRecognized
+from utils import UnknownExportVersion, parse_packet
+from v9 import V9TemplateNotRecognized
 
 # Type definitions
 RawPacket = namedtuple('RawPacket', ['ts', 'client', 'data'])
